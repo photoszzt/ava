@@ -1,12 +1,10 @@
 #include <assert.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <plog/Log.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -15,35 +13,35 @@
 #include "common/devconf.h"
 #include "common/guest_mem.h"
 #include "common/ioctl.h"
+#include "common/logging.h"
 #include "common/socket.hpp"
-#include "worker.h"
+#include "memory.h"
 
-// TODO: This file should be merged with cmd_channel_shm.c!!!
+// TODO: This file should be merged with cmd_channel_shm_worker.c!!!
+
+extern int vm_id;
+extern struct param_block_info nw_global_pb_info;
+extern int nw_global_vm_id;
 
 struct command_channel_shm {
   struct command_channel_base base;
-  int guestlib_fd;
-  int listen_fd;
+  int sock_fd;
   int shm_fd;
-
   struct pollfd pfd;
-  MemoryRegion shm;
+  // struct desc_slab desc_slab_list;
   struct param_block param_block;
-
   int vm_id;
-  int listen_port;
-  uint8_t init_command_type;
 
   /* Channel locks */
   pthread_mutex_t send_mutex;
   pthread_mutex_t recv_mutex;
 };
 
+pthread_spinlock_t block_lock;
+
 namespace {
 extern struct command_channel_vtable command_channel_shm_vtable;
 }
-
-pthread_spinlock_t block_lock;
 
 /**
  * Print a command for debugging.
@@ -61,14 +59,14 @@ static void command_channel_shm_print_command(const struct command_channel *chan
 static size_t command_channel_shm_buffer_size(const struct command_channel *chan, size_t size) {
   // For shared memory implementations this should round the size up
   // to a cache line, so as to maintain the alignment of buffers when
-  // they are concatinated into the data region.
+  // they are concatenated into the data region.
 
   // TODO: alignment (round up to command_channel_shm->alignment)
   return size;
 }
 
 /**
- * Reserve a memory region on BAR
+ * Reserve a memory region on BAR.
  *
  * Return the offset of the region or NULL if no enough space.
  * Guestlib->worker communication uses the first half of the space, and
@@ -82,7 +80,7 @@ static uintptr_t reserve_param_block(struct param_block *block, size_t size) {
   // TODO: implement the **real** memory allocator (mask used regions)
   pthread_spin_lock(&block_lock);
 
-  if (block->cur_offset + size >= block->size) block->cur_offset = (block->size / 2);
+  if (block->cur_offset + size >= (block->size / 2)) block->cur_offset = 0;
 
   ret_offset = (uintptr_t)block->cur_offset;
   block->cur_offset += size;
@@ -112,8 +110,7 @@ static struct command_base *command_channel_shm_new_command(struct command_chann
     data_region_size += 0x4;
     seeker->local_offset = reserve_param_block(&chan->param_block, data_region_size);
     seeker->cur_offset = seeker->local_offset + 0x4;
-    // TODO: Should the line below have `+ chan->param_block.offset`
-    cmd->data_region = (void *)seeker->local_offset;
+    cmd->data_region = (void *)(seeker->local_offset + chan->param_block.offset);
   }
   cmd->region_size = data_region_size;
   cmd->vm_id = chan->vm_id;
@@ -152,11 +149,11 @@ static void *command_channel_shm_attach_buffer(struct command_channel *c, struct
 static void command_channel_shm_send_command(struct command_channel *c, struct command_base *cmd) {
   struct command_channel_shm *chan = (struct command_channel_shm *)c;
 
-  command_channel_shm_print_command(c, cmd);
+  cmd->command_type = NW_NEW_INVOCATION;
 
   /* vsock interposition does not block send_message */
   pthread_mutex_lock(&chan->send_mutex);
-  send_socket(chan->guestlib_fd, cmd, cmd->command_size);
+  send_socket(chan->sock_fd, cmd, cmd->command_size);
   pthread_mutex_unlock(&chan->send_mutex);
 
   // Free local copy of command struct
@@ -197,26 +194,25 @@ static struct command_base *command_channel_shm_receive_command(struct command_c
   ret = poll(&chan->pfd, 1, -1);
   if (ret < 0) {
     fprintf(stderr, "failed to poll\n");
-    exit(-1);
+    exit(0);
   }
 
   if (chan->pfd.revents == 0) return NULL;
 
-  /* terminate worker when guestlib exits */
+  /* terminate guestlib when worker exits */
   if (chan->pfd.revents & POLLRDHUP) {
-    fprintf(stderr, "[worker#%d] guestlib shutdown\n", chan->listen_port);
+    AVA_WARNING << "worker shutdown";
     close(chan->pfd.fd);
-    exit(-1);
+    exit(0);
   }
 
   if (chan->pfd.revents & POLLIN) {
     pthread_mutex_lock(&chan->recv_mutex);
-    LOG_DEBUG << "[worker#" << chan->listen_port << "] start to recv guestlib message";
-    recv_socket(chan->guestlib_fd, &cmd_base, sizeof(struct command_base));
-    LOG_DEBUG << "[worker#" << chan->listen_port << "] recv guestlib message";
+    memset(&cmd_base, 0, sizeof(struct command_base));
+    recv_socket(chan->pfd.fd, &cmd_base, sizeof(struct command_base));
     cmd = (struct command_base *)malloc(cmd_base.command_size);
     memcpy(cmd, &cmd_base, sizeof(struct command_base));
-    recv_socket(chan->guestlib_fd, (void *)cmd + sizeof(struct command_base),
+    recv_socket(chan->pfd.fd, (void *)cmd + sizeof(struct command_base),
                 cmd_base.command_size - sizeof(struct command_base));
     pthread_mutex_unlock(&chan->recv_mutex);
 
@@ -256,90 +252,95 @@ static void *command_channel_shm_get_data_region(const struct command_channel *c
 /**
  * Free a command returned by `command_channel_receive_command`.
  */
-static void command_channel_shm_free_command(struct command_channel *c, struct command_base *cmd) { free(cmd); }
+static void command_channel_shm_free_command(struct command_channel *chan, struct command_base *cmd) { free(cmd); }
 
 /**
- * Initialize a new command channel for worker with vsock as doorbell and
- * shared memory as data transport.
+ * Initialize a new command channel with vsock as doorbell and shared
+ * memory as data transport.
  */
-struct command_channel *command_channel_shm_worker_new(int listen_port) {
+struct command_channel *command_channel_shm_guest_new() {
   struct command_channel_shm *chan = (struct command_channel_shm *)malloc(sizeof(struct command_channel_shm));
   command_channel_preinitialize((struct command_channel *)chan, &command_channel_shm_vtable);
   pthread_spin_init(&block_lock, 0);
   pthread_mutex_init(&chan->send_mutex, NULL);
   pthread_mutex_init(&chan->recv_mutex, NULL);
 
-  /* set up worker info */
-  chan->shm.size = AVA_HOST_SHM_SIZE;
+  /* setup shared memory */
+  char dev_filename[32];
+  sprintf(dev_filename, "/dev/%s%d", VGPU_DEV_NAME, VGPU_DRIVER_MINOR);
 
-  // TODO: notify executor when VM created or destroyed
-  chan->listen_port = listen_port;
+  chan->shm_fd = open(dev_filename, O_RDWR);
+  if (chan->shm_fd < 0) {
+    fprintf(stderr, "failed to open device %s\n", dev_filename);
+    exit(-1);
+  }
+
+  /* acquire vm id */
+  chan->vm_id = nw_global_vm_id = ioctl(chan->shm_fd, IOCTL_GET_VM_ID);
+  if (chan->vm_id <= 0) {
+    fprintf(stderr, "failed to retrieve vm id: %d\n", chan->vm_id);
+    exit(-1);
+  }
+  fprintf(stderr, "assigned vm_id=%d\n", chan->vm_id);
+
+  chan->param_block.size = AVA_APP_SHM_SIZE_DEFAULT;
+  chan->param_block.offset = ioctl(chan->shm_fd, IOCTL_REQUEST_SHM, chan->param_block.size);
+  chan->param_block.base = mmap(NULL, chan->param_block.size, PROT_READ | PROT_WRITE, MAP_SHARED, chan->shm_fd, 0);
+  nw_global_pb_info.param_local_offset = chan->param_block.offset;
+  nw_global_pb_info.param_block_size = chan->param_block.size;
+  fprintf(stderr, "param_block size=%lx, offset=%lx, base=%lx\n", chan->param_block.size, chan->param_block.offset,
+          (uintptr_t)chan->param_block.base);
+
+  /**
+   * Get manager's host address from ENV('AVA_MANAGER_ADDR').
+   * The address can either be a full IP:port (e.g. 0.0.0.0:3333),
+   * or only the port (3333), but the IP address is always ignored as
+   * the manager is assumed to be on the local server.
+   */
+  char *manager_full_address;
+  int manager_port;
+  manager_full_address = getenv("AVA_MANAGER_ADDR");
+  assert(manager_full_address != NULL && "AVA_MANAGER_ADDR is not set");
+  parseServerAddress(manager_full_address, NULL, NULL, &manager_port);
+  assert(manager_port > 0 && "Invalid manager port");
+
+  /* connect worker manager and send vm_id, param_block offset (inside
+   * the VM's shared memory region) and param_block size. */
+  struct sockaddr_vm sa;
+  int manager_fd = init_vm_socket(&sa, VMADDR_CID_HOST, manager_port);
+  conn_vm_socket(manager_fd, &sa);
+
+  struct command_base *msg =
+      command_channel_shm_new_command((struct command_channel *)chan, sizeof(struct command_base), 0);
+  msg->command_type = NW_NEW_APPLICATION;
+  struct param_block_info *pb_info = (struct param_block_info *)msg->reserved_area;
+  pb_info->param_local_offset = chan->param_block.offset;
+  pb_info->param_block_size = chan->param_block.size;
+  send_socket(manager_fd, msg, sizeof(struct command_base));
+
+  recv_socket(manager_fd, msg, sizeof(struct command_base));
+  uintptr_t worker_port = *((uintptr_t *)msg->reserved_area);
   assert(nw_worker_id == 0);  // TODO: Move assignment to nw_worker_id out of
                               // unrelated constructor.
-  nw_worker_id = listen_port;
+  nw_worker_id = worker_port;
+  command_channel_shm_free_command((struct command_channel *)chan, msg);
+  close(manager_fd);
 
-  /* setup shared memory */
-  if ((chan->shm_fd = open("/dev/kvm-vgpu", O_RDWR | O_NONBLOCK)) < 0) {
-    printf("failed to open /dev/kvm-vgpu\n");
-    exit(0);
-  }
-  chan->shm.addr = mmap(NULL, chan->shm.size, PROT_READ | PROT_WRITE, MAP_SHARED, chan->shm_fd, 0);
-  if (chan->shm.addr == MAP_FAILED) {
-    printf("mmap shared memory failed: %s\n", strerror(errno));
-    // TODO: add exit labels
-    exit(0);
-  } else
-    printf("mmap shared memory to 0x%lx\n", (uintptr_t)chan->shm.addr);
+  /* connect worker */
+  fprintf(stderr, "assigned worker at %lu\n", worker_port);
+  chan->sock_fd = init_vm_socket(&sa, VMADDR_CID_HOST, worker_port);
+  // FIXME: connect is always non-blocking for vm socket!
+  if (!getenv("AVA_WPOOL") || !strcmp(getenv("AVA_WPOOL"), "FALSE")) usleep(5000000);
+  conn_vm_socket(chan->sock_fd, &sa);
 
-  /* connect guestlib */
-  struct sockaddr_vm sa_listen;
-  chan->listen_fd = init_vm_socket(&sa_listen, VMADDR_CID_ANY, chan->listen_port);
-  listen_vm_socket(chan->listen_fd, &sa_listen);
-
-  printf("[worker&%d] waiting for guestlib connection\n", listen_port);
-  chan->guestlib_fd = accept_vm_socket(chan->listen_fd, NULL);
-  printf("[worker@%d] guestlib connection accepted\n", listen_port);
-
-  struct command_handler_initialize_api_command init_msg;
-  recv_socket(chan->guestlib_fd, &init_msg, sizeof(struct command_handler_initialize_api_command));
-  chan->init_command_type = init_msg.new_api_id;
-  chan->vm_id = init_msg.base.vm_id;
-  /* worker uses the last half of the parameter block.
-   *   base: start address of the whole parameter block;
-   *   size: size of the block;
-   *   offset: offset of the block to the VM's shared memory base;
-   *   cur_offset: the moving pointer for attaching buffers. */
-  chan->param_block.offset = init_msg.pb_info.param_local_offset;
-  chan->param_block.size = init_msg.pb_info.param_block_size;
-  chan->param_block.cur_offset = (chan->param_block.size >> 1);
-  chan->param_block.base = chan->shm.addr + (chan->vm_id - 1) * AVA_GUEST_SHM_SIZE + chan->param_block.offset;
-  printf("[worker@%d] vm_id=%d, api_id=%x, pb_info={%lx,%lx}\n", listen_port, chan->vm_id, chan->init_command_type,
-         chan->param_block.size, chan->param_block.offset);
-
-  if (ioctl(chan->shm_fd, KVM_NOTIFY_NEW_WORKER, (unsigned long)chan->vm_id) < 0) {
-    printf("failed to notify worker id\n");
-    exit(0);
-  }
-  printf("[worker#%d] kvm-vgpu notified\n", chan->vm_id);
-
-  // TODO: also poll netlink socket, and put the swapping task in the same
-  // task queue just as the normal invocations.
-  chan->pfd.fd = chan->guestlib_fd;
+  chan->pfd.fd = chan->sock_fd;
   chan->pfd.events = POLLIN | POLLRDHUP;
-
-  /*
-  if (fcntl(ex_st.client_fd, F_SETFL,
-            fcntl(ex_st.client_fd, F_GETFL) & (~O_NONBLOCK)) < 0) {
-      perror("fcntl blocking failed");
-      return 0;
-  }
-  */
 
   return (struct command_channel *)chan;
 }
 
 /**
- * Disconnect worker's command channel and free all resources associated
+ * Disconnect this command channel and free all resources associated
  * with it.
  */
 static void command_channel_shm_free(struct command_channel *c) {
@@ -349,8 +350,12 @@ static void command_channel_shm_free(struct command_channel *c) {
   pthread_mutex_destroy(&chan->send_mutex);
   pthread_mutex_destroy(&chan->recv_mutex);
 
-  munmap(chan->shm.addr, chan->shm.size);
-  if (chan->shm_fd > 0) close(chan->shm_fd);
+  munmap(chan->param_block.base, chan->param_block.size);
+  // TODO: unmap slabs
+  // TODO: destroy sems
+
+  close(chan->sock_fd);
+  close(chan->shm_fd);
   free(chan);
 }
 
@@ -361,3 +366,9 @@ struct command_channel_vtable command_channel_shm_vtable = {
     command_channel_shm_get_buffer,   command_channel_shm_get_data_region,  command_channel_shm_free_command,
     command_channel_shm_free,         command_channel_shm_print_command};
 }
+
+// warning TODO: Does there need to be a separate socket specific function which
+// handles listening/accepting instead of connecting?
+
+// warning TODO: Make a header file "cmd_channel_socket.h" for the
+// command_channel_socket_new and other socket specific APIs.
