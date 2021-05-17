@@ -1,0 +1,29 @@
+[
+    {
+        "directory": "/source/cava/samples/cudart",
+        "arguments": [
+            "g++",
+            "-I/usr/local/cuda-10.1/include",
+            "-L/usr/local/cuda-10.1/lib64",
+            "-I/usr/include/glib-2.0",
+            "-I/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+            "-I/source/cava/cudart_nw",
+            "-I/source",
+            "-I/source/common",
+            "-I/source/third_party/plog/include",
+            "-I/source/cava/headers/",
+            "-lcudart",
+            "-lcuda",
+            "-lcublas",
+            "-lcudnn",
+            "-lcufft",
+            "-lcurand",
+            "-lcusparse",
+            "-lcusolver",
+            "-x",
+            "c++",
+            "cudart.cpp"
+        ],
+        "file": "cudart.cpp"
+    }
+]
